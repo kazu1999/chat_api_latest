@@ -1,0 +1,15 @@
+env/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# Local environment files
+.env
+
+# Editor/OS junk
+.idea/
+.vscode/
+Thumbs.db
+

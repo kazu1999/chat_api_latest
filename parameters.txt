@@ -1,0 +1,84 @@
+{
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "list_tasks",
+        "description": "List all tasks",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "create_task",
+        "description": "Create a task (Name/Phone/Address/Start Datetime/Request)",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string", "description": "予約者名（フルネーム）" },
+            "phone_number": { "type": "string", "description": "電話番号" },
+            "address": { "type": "string", "description": "住所（都道府県から）" },
+            "start_datetime": { "type": "string", "description": "YYYY-MM-DD または YYYY-MM-DD HH:MM" },
+            "request": { "type": "string", "description": "要望（自由記述）" }
+          },
+          "required": [ "name" ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_task",
+        "description": "Get a task by name",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" }
+          },
+          "required": [ "name" ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "update_task",
+        "description": "Update a task fields (any of phone_number/address/start_datetime/request)",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "phone_number": { "type": "string" },
+            "address": { "type": "string" },
+            "start_datetime": { "type": "string" },
+            "request": { "type": "string" }
+          },
+          "required": [ "name" ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "delete_task",
+        "description": "Delete a task",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" }
+          },
+          "required": [ "name" ],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}
