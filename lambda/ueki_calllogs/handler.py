@@ -11,7 +11,7 @@ from typing import Optional
 import boto3
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import BotoCoreError, ClientError
-
+import auth
 
 CALLS_TABLE_NAME = os.getenv("CALL_LOGS_TABLE_NAME", "ueki-chatbot")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID") or ""
@@ -20,6 +20,7 @@ OPENAI_SECRET_NAME = os.getenv("OPENAI_SECRET_NAME") or "UEKI_OPENAI_APIKEY"
 OPENAI_API_KEY_ENV = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_APIKEY") or os.getenv("OPENAI_API_TOKEN")
 OPENAI_PROJECT_ENV = os.getenv("OPENAI_PROJECT") or os.getenv("OPENAI_PROJECT_ID")
 OPENAI_ORG_ENV = os.getenv("OPENAI_ORG") or os.getenv("OPENAI_ORGANIZATION")
+
 _ddb = boto3.resource("dynamodb")
 _table = _ddb.Table(CALLS_TABLE_NAME)
 _session = boto3.session.Session()
@@ -191,6 +192,8 @@ def _get_openai_project_id() -> Optional[str]:
 
 def handler(event, context):
     try:
+        client_id = auth.get_client_id(event)
+        
         http = event.get("requestContext", {}).get("http", {})
         method = http.get("method", "GET").upper()
         path = http.get("path", "/")
@@ -339,8 +342,9 @@ def handler(event, context):
         if method == "GET" and path.startswith("/calls"):
             q = _parse_query(event)
             phone = _normalize_phone_number(q.get("phone"))
-            if not phone:
-                return _resp(400, {"ok": False, "error": "phone is required"})
+            # If phone is not provided, we list recent calls for the client
+            # using TsIndex (GSI: PK=client_id, SK=ts)
+            
             ts_from = q.get("from")
             ts_to = q.get("to")
             limit = int(q.get("limit") or 50)
@@ -348,38 +352,65 @@ def handler(event, context):
             next_token = None
             if "next_token" in q and q["next_token"]:
                 try:
-                    next_token = json.loads(q["next_token"])  # serialized ExclusiveStartKey
+                    next_token = json.loads(q["next_token"])
                 except Exception:
                     next_token = None
 
-            kwargs = {
-                "KeyConditionExpression": Key("phone_number").eq(phone),
-                "ScanIndexForward": False if order == "desc" else True,
-                "Limit": limit,
-            }
-            if ts_from and ts_to:
-                kwargs["KeyConditionExpression"] = Key("phone_number").eq(phone) & Key("ts").between(ts_from, ts_to)
-            elif ts_from:
-                kwargs["KeyConditionExpression"] = Key("phone_number").eq(phone) & Key("ts").gte(ts_from)
-            elif ts_to:
-                kwargs["KeyConditionExpression"] = Key("phone_number").eq(phone) & Key("ts").lte(ts_to)
+            if phone:
+                # Query by client_id & sk prefix
+                prefix = phone + "#"
+                kwargs = {
+                    "KeyConditionExpression": Key("client_id").eq(client_id) & Key("sk").begins_with(prefix),
+                    "ScanIndexForward": False if order == "desc" else True,
+                    "Limit": limit,
+                }
+                # Time range filtering for specific phone is tricky with composite key prefix.
+                # If ts_from/to is provided, we can't easily use begins_with prefix AND range on sk.
+                # But since sk = phone#ts, we can construct range keys:
+                # start_sk = phone#ts_from, end_sk = phone#ts_to
+                if ts_from or ts_to:
+                    s_min = ts_from or "0000"
+                    s_max = ts_to or "9999"
+                    # Overwrite condition
+                    kwargs["KeyConditionExpression"] = Key("client_id").eq(client_id) & Key("sk").between(f"{phone}#{s_min}", f"{phone}#{s_max}")
+            else:
+                # Query all calls for client using GSI
+                kwargs = {
+                    "IndexName": "TsIndex",
+                    "KeyConditionExpression": Key("client_id").eq(client_id),
+                    "ScanIndexForward": False if order == "desc" else True,
+                    "Limit": limit,
+                }
+                if ts_from and ts_to:
+                    kwargs["KeyConditionExpression"] = Key("client_id").eq(client_id) & Key("ts").between(ts_from, ts_to)
+                elif ts_from:
+                    kwargs["KeyConditionExpression"] = Key("client_id").eq(client_id) & Key("ts").gte(ts_from)
+                elif ts_to:
+                    kwargs["KeyConditionExpression"] = Key("client_id").eq(client_id) & Key("ts").lte(ts_to)
+
             if next_token:
                 kwargs["ExclusiveStartKey"] = next_token
 
             r = _table.query(**kwargs)
             return _resp(200, {"ok": True, "items": r.get("Items", []), "next_token": r.get("LastEvaluatedKey")})
 
-        # List distinct phones (scan, dedupe)
+        # List distinct phones
         if method == "GET" and path.startswith("/phones"):
             try:
                 phones = set()
                 last_key = None
+                # Use Query instead of Scan (efficient tenant isolation)
+                # Query TsIndex (all items for this client)
                 while True:
-                    # Scan in small pages to avoid timeouts/large payloads
-                    scan_kwargs = {"Limit": 500}
+                    kwargs = {
+                        "IndexName": "TsIndex",
+                        "KeyConditionExpression": Key("client_id").eq(client_id),
+                        "Limit": 500,
+                        "ProjectionExpression": "phone_number" # optimize fetch
+                    }
                     if last_key:
-                        scan_kwargs["ExclusiveStartKey"] = last_key
-                    r = _table.scan(**scan_kwargs)
+                        kwargs["ExclusiveStartKey"] = last_key
+                    r = _table.query(**kwargs)
                     for it in r.get("Items", []):
                         pn = it.get("phone_number")
                         if pn:
@@ -391,7 +422,6 @@ def handler(event, context):
                         break
                 return _resp(200, {"ok": True, "items": sorted(list(phones))})
             except Exception as e:
-                # Force log to CloudWatch for quick diagnosis
                 print(f"[ueki-calllogs] /phones error: {e}", flush=True)
                 return _resp(500, {"ok": False, "error": str(e)})
 
@@ -405,7 +435,11 @@ def handler(event, context):
             user_text = body.get("user_text") or ""
             assistant_text = body.get("assistant_text") or ""
             call_sid = body.get("call_sid") or body.get("callSid") or ""
+            
+            sk = f"{phone}#{ts}"
             item = {
+                "client_id": client_id,
+                "sk": sk,
                 "phone_number": phone,
                 "ts": ts,
                 "user_text": user_text,
@@ -421,13 +455,14 @@ def handler(event, context):
             phone = _normalize_phone_number(q.get("phone"))
             ts = q.get("ts")
             call_sid = q.get("call_sid") or q.get("callSid")
+            
             if call_sid and not (phone and ts):
-                # Lookup by GSI callSidIndex (return all items for this session)
+                # Lookup by GSI CallSidIndex
                 items_acc = []
                 last_key = None
                 while True:
                     kwargs = {
-                        "IndexName": "callSidIndex",
+                        "IndexName": "CallSidIndex",
                         "KeyConditionExpression": Key("call_sid").eq(call_sid),
                         "Limit": 200,
                     }
@@ -438,12 +473,18 @@ def handler(event, context):
                     last_key = r.get("LastEvaluatedKey")
                     if not last_key:
                         break
+                # Tenant filtering (safety)
+                items_acc = [it for it in items_acc if it.get("client_id") == client_id]
+                
                 if not items_acc:
                     return _resp(404, {"ok": False, "error": "not found"})
                 return _resp(200, {"ok": True, "items": items_acc})
+                
             if not phone or not ts:
                 return _resp(400, {"ok": False, "error": "phone and ts required (or provide call_sid)"})
-            r = _table.get_item(Key={"phone_number": phone, "ts": ts})
+            
+            sk = f"{phone}#{ts}"
+            r = _table.get_item(Key={"client_id": client_id, "sk": sk})
             it = r.get("Item")
             if not it:
                 return _resp(404, {"ok": False, "error": "not found"})
@@ -456,6 +497,8 @@ def handler(event, context):
             ts = body.get("ts")
             if not phone or not ts:
                 return _resp(400, {"ok": False, "error": "phone_number and ts required"})
+            
+            sk = f"{phone}#{ts}"
             expr = []
             values = {}
             if "user_text" in body:
@@ -470,10 +513,10 @@ def handler(event, context):
             if not expr:
                 return _resp(400, {"ok": False, "error": "nothing to update"})
             r = _table.update_item(
-                Key={"phone_number": phone, "ts": ts},
+                Key={"client_id": client_id, "sk": sk},
                 UpdateExpression="SET " + ", ".join(expr),
                 ExpressionAttributeValues=values,
-                ConditionExpression="attribute_exists(phone_number) AND attribute_exists(ts)",
+                ConditionExpression="attribute_exists(client_id) AND attribute_exists(sk)",
                 ReturnValues="ALL_NEW",
             )
             return _resp(200, {"ok": True, "item": r.get("Attributes")})
@@ -484,39 +527,45 @@ def handler(event, context):
             phone = _normalize_phone_number(q.get("phone"))
             ts = q.get("ts")
             call_sid = q.get("call_sid") or q.get("callSid")
+            
             if call_sid and not (phone and ts):
                 # delete all items by call_sid via GSI scan + per-item delete
                 items_acc = []
                 last_key = None
                 while True:
                     kwargs = {
-                        "IndexName": "callSidIndex",
+                        "IndexName": "CallSidIndex",
                         "KeyConditionExpression": Key("call_sid").eq(call_sid),
                         "Limit": 200,
                     }
                     if last_key:
                         kwargs["ExclusiveStartKey"] = last_key
                     r = _table.query(**kwargs)
-                    items = r.get("Items", [])
-                    items_acc.extend(items)
+                    items_acc.extend(r.get("Items", []))
                     last_key = r.get("LastEvaluatedKey")
                     if not last_key:
                         break
-                # delete one by one (can be optimized to batch_write)
+                # Tenant filter
+                items_acc = [it for it in items_acc if it.get("client_id") == client_id]
+                
+                # delete one by one
                 for it in items_acc:
-                    pk = it.get("phone_number")
-                    sk = it.get("ts")
+                    pk = it.get("client_id")
+                    sk = it.get("sk")
                     if pk and sk:
                         _table.delete_item(
-                            Key={"phone_number": pk, "ts": sk},
-                            ConditionExpression="attribute_exists(phone_number) AND attribute_exists(ts)",
+                            Key={"client_id": pk, "sk": sk},
+                            ConditionExpression="attribute_exists(client_id) AND attribute_exists(sk)",
                         )
                 return _resp(200, {"ok": True, "deleted": len(items_acc)})
+                
             if not phone or not ts:
                 return _resp(400, {"ok": False, "error": "phone and ts required (or provide call_sid)"})
+            
+            sk = f"{phone}#{ts}"
             _table.delete_item(
-                Key={"phone_number": phone, "ts": ts},
-                ConditionExpression="attribute_exists(phone_number) AND attribute_exists(ts)",
+                Key={"client_id": client_id, "sk": sk},
+                ConditionExpression="attribute_exists(client_id) AND attribute_exists(sk)",
             )
             return _resp(200, {"ok": True})
 
@@ -528,5 +577,3 @@ def handler(event, context):
         return _resp(status, {"ok": False, "error": str(e)})
     except (BotoCoreError, Exception) as e:
         return _resp(500, {"ok": False, "error": str(e)})
-
-

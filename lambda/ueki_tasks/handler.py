@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
+import auth
 
 TABLE_NAME = os.getenv("TASKS_TABLE_NAME", "ueki-tasks")
 _ddb = boto3.resource("dynamodb")
@@ -26,6 +27,8 @@ def _resp(status: int, body: dict):
 
 def handler(event, context):
     try:
+        client_id = auth.get_client_id(event)
+        
         http = event.get("requestContext", {}).get("http", {})
         method = http.get("method", "GET").upper()
         path = http.get("path", "/")
@@ -35,7 +38,12 @@ def handler(event, context):
 
         # List tasks
         if method == "GET" and path == "/tasks":
-            r = _table.scan(Limit=200)
+            # Use Query instead of Scan for tenant isolation
+            from boto3.dynamodb.conditions import Key
+            r = _table.query(
+                KeyConditionExpression=Key("client_id").eq(client_id),
+                Limit=200
+            )
             return _resp(200, {"ok": True, "items": r.get("Items", [])})
 
         if path.startswith("/task"):
@@ -54,6 +62,7 @@ def handler(event, context):
                 if not nm:
                     return _resp(400, {"ok": False, "error": "name required"})
                 item = {
+                    "client_id": client_id,
                     "name": nm,
                     "phone_number": phone,
                     "address": address,
@@ -70,7 +79,7 @@ def handler(event, context):
                 return _resp(200, {"ok": True, "item": item})
 
             if method == "GET" and name:
-                r = _table.get_item(Key={"name": name})
+                r = _table.get_item(Key={"client_id": client_id, "name": name})
                 it = r.get("Item")
                 if not it:
                     return _resp(404, {"ok": False, "error": "not found"})
@@ -105,7 +114,7 @@ def handler(event, context):
                 expr_parts.append("#updated_at = :updated_at")
 
                 r = _table.update_item(
-                    Key={"name": name},
+                    Key={"client_id": client_id, "name": name},
                     UpdateExpression="SET " + ", ".join(expr_parts),
                     ExpressionAttributeValues=expr_attr_values,
                     ExpressionAttributeNames=expr_attr_names,
@@ -116,7 +125,7 @@ def handler(event, context):
 
             if method == "DELETE" and name:
                 _table.delete_item(
-                    Key={"name": name},
+                    Key={"client_id": client_id, "name": name},
                     ConditionExpression="attribute_exists(#n)",
                     ExpressionAttributeNames={"#n": "name"},
                 )
@@ -130,5 +139,3 @@ def handler(event, context):
         return _resp(status, {"ok": False, "error": str(e)})
     except (BotoCoreError, Exception) as e:
         return _resp(500, {"ok": False, "error": str(e)})
-
-

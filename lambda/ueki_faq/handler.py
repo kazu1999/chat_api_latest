@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
-
+import auth
 
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-1")
 FAQ_TABLE_NAME = os.getenv("FAQ_TABLE_NAME", "ueki-faq")
@@ -32,6 +32,8 @@ def _resp(status: int, body: dict):
 
 def handler(event, context):
     try:
+        client_id = auth.get_client_id(event)
+        
         http = event.get("requestContext", {}).get("http", {})
         method = http.get("method", "GET").upper()
         path = http.get("path", "/")
@@ -40,8 +42,12 @@ def handler(event, context):
             return _resp(200, {"ok": True})
 
         if method == "GET" and path.startswith("/faqs"):
-            # list
-            resp = _table.scan(Limit=200)
+            # list: Use Query instead of Scan for tenant isolation
+            from boto3.dynamodb.conditions import Key
+            resp = _table.query(
+                KeyConditionExpression=Key("client_id").eq(client_id),
+                Limit=200
+            )
             return _resp(200, {"ok": True, "items": resp.get("Items", [])})
 
         if path.startswith("/faq"):
@@ -57,12 +63,24 @@ def handler(event, context):
                 a = body.get("answer")
                 if not q or a is None:
                     return _resp(400, {"ok": False, "error": "question and answer required"})
-                item = {"question": q, "answer": a, "created_at": _now_iso(), "updated_at": _now_iso()}
-                _table.put_item(Item=item, ConditionExpression="attribute_not_exists(question)")
+                item = {
+                    "client_id": client_id,
+                    "question": q,
+                    "answer": a,
+                    "created_at": _now_iso(),
+                    "updated_at": _now_iso()
+                }
+                # Condition: question must not exist FOR THIS CLIENT
+                _table.put_item(
+                    Item=item, 
+                    ConditionExpression="attribute_not_exists(question)" 
+                    # Strictly, "attribute_not_exists(question)" checks if the item with PK+SK exists.
+                    # Since PK=client_id, SK=question, this works perfectly.
+                )
                 return _resp(200, {"ok": True, "item": item})
 
             if method == "GET" and question:
-                r = _table.get_item(Key={"question": question})
+                r = _table.get_item(Key={"client_id": client_id, "question": question})
                 item = r.get("Item")
                 if not item:
                     return _resp(404, {"ok": False, "error": "not found"})
@@ -74,7 +92,7 @@ def handler(event, context):
                 if a is None:
                     return _resp(400, {"ok": False, "error": "answer required"})
                 r = _table.update_item(
-                    Key={"question": question},
+                    Key={"client_id": client_id, "question": question},
                     UpdateExpression="SET answer = :a, updated_at = :u",
                     ExpressionAttributeValues={":a": a, ":u": _now_iso()},
                     ConditionExpression="attribute_exists(question)",
@@ -83,7 +101,10 @@ def handler(event, context):
                 return _resp(200, {"ok": True, "item": r.get("Attributes")})
 
             if method == "DELETE" and question:
-                _table.delete_item(Key={"question": question}, ConditionExpression="attribute_exists(question)")
+                _table.delete_item(
+                    Key={"client_id": client_id, "question": question},
+                    ConditionExpression="attribute_exists(question)"
+                )
                 return _resp(200, {"ok": True})
 
         return _resp(404, {"ok": False, "error": "route not found"})
@@ -94,5 +115,3 @@ def handler(event, context):
         return _resp(status, {"ok": False, "error": str(e)})
     except (BotoCoreError, Exception) as e:
         return _resp(500, {"ok": False, "error": str(e)})
-
-

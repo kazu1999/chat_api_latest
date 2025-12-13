@@ -9,11 +9,13 @@ import boto3
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import BotoCoreError, ClientError
 import urllib.request
-
+import auth  # Local auth helper
 
 CALLS_TABLE_NAME = os.getenv("CALL_LOGS_TABLE_NAME", "ueki-chatbot")
 FAQ_TABLE_NAME = os.getenv("FAQ_TABLE_NAME", "ueki-faq")
 PROMPTS_TABLE_NAME = os.getenv("PROMPTS_TABLE_NAME", "ueki-prompts")
+TASKS_TABLE_NAME = os.getenv("TASKS_TABLE_NAME", "ueki-tasks")
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_PROJECT = os.getenv("OPENAI_PROJECT", "")
 OPENAI_ORG = os.getenv("OPENAI_ORG", os.getenv("OPENAI_ORGANIZATION", ""))
@@ -24,7 +26,6 @@ _ddb = boto3.resource("dynamodb")
 _calls = _ddb.Table(CALLS_TABLE_NAME)
 _faq = _ddb.Table(FAQ_TABLE_NAME)
 _prompts = _ddb.Table(PROMPTS_TABLE_NAME)
-TASKS_TABLE_NAME = os.getenv("TASKS_TABLE_NAME") or "ueki-tasks"
 _tasks = _ddb.Table(TASKS_TABLE_NAME)
 
 LOG_GROUP_NAME = "/aws/lambda/ueki-chat"
@@ -80,33 +81,29 @@ def _normalize_phone_number(raw: Optional[str]) -> Optional[str]:
     return s
 
 
-def _read_system_prompt() -> str:
+def _read_system_prompt(client_id: str) -> str:
     # Try to load from prompts table (id = 'system')
     try:
-        r = _prompts.get_item(Key={"id": "system"})
+        r = _prompts.get_item(Key={"client_id": client_id, "id": "system"})
         item = r.get("Item")
         if item and item.get("content"):
             return str(item.get("content"))
     except (BotoCoreError, ClientError):
         pass
-    # Fallback to bundled file for backward compatibility
-    path = os.path.join(os.path.dirname(__file__), "system_prompt.txt")
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-    except Exception:
-        return ""
+    # Fallback default if nothing in DB
+    return ""
 
-def _put_system_prompt(markdown: str) -> None:
+def _put_system_prompt(client_id: str, markdown: str) -> None:
     _prompts.put_item(Item={
+        "client_id": client_id,
         "id": "system",
         "content": markdown,
         "updated_at": _now_iso(),
     })
 
-def _read_func_config() -> Dict:
+def _read_func_config(client_id: str) -> Dict:
     try:
-        r = _prompts.get_item(Key={"id": "functions"})
+        r = _prompts.get_item(Key={"client_id": client_id, "id": "functions"})
         item = r.get("Item")
         if item and item.get("content"):
             raw = item.get("content")
@@ -118,16 +115,17 @@ def _read_func_config() -> Dict:
         pass
     return {"tools": [], "instructions": ""}
 
-def _put_func_config(cfg: Dict) -> None:
+def _put_func_config(client_id: str, cfg: Dict) -> None:
     _prompts.put_item(Item={
+        "client_id": client_id,
         "id": "functions",
         "content": cfg,
         "updated_at": _now_iso(),
     })
 
-def _read_ext_tools() -> Dict:
+def _read_ext_tools(client_id: str) -> Dict:
     try:
-        r = _prompts.get_item(Key={"id": "ext-tools"})
+        r = _prompts.get_item(Key={"client_id": client_id, "id": "ext-tools"})
         item = r.get("Item")
         if item and item.get("content"):
             raw = item.get("content")
@@ -139,19 +137,24 @@ def _read_ext_tools() -> Dict:
         pass
     return {"ext_tools": []}
 
-def _put_ext_tools(cfg: Dict) -> None:
+def _put_ext_tools(client_id: str, cfg: Dict) -> None:
     _prompts.put_item(Item={
+        "client_id": client_id,
         "id": "ext-tools",
         "content": cfg,
         "updated_at": _now_iso(),
     })
 
 # ---- Tools (Function Calling) implementations ----
-def _tool_list_tasks(args: Dict[str, Any]) -> Dict[str, Any]:
-    r = _tasks.scan(Limit=200)
+def _tool_list_tasks(client_id: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    # Use Query instead of Scan for tenant isolation
+    r = _tasks.query(
+        KeyConditionExpression=Key("client_id").eq(client_id),
+        Limit=200
+    )
     return {"items": r.get("Items", [])}
 
-def _tool_create_task(args: Dict[str, Any]) -> Dict[str, Any]:
+def _tool_create_task(client_id: str, args: Dict[str, Any]) -> Dict[str, Any]:
     name = args.get("name")
     request = args.get("request") or args.get("requirement") or ""
     start_datetime = args.get("start_datetime") or args.get("start_date") or ""
@@ -160,6 +163,7 @@ def _tool_create_task(args: Dict[str, Any]) -> Dict[str, Any]:
     if not name:
         return {"error": "name is required"}
     item = {
+        "client_id": client_id,
         "name": str(name),
         "request": str(request),
         "start_datetime": str(start_datetime),
@@ -169,19 +173,20 @@ def _tool_create_task(args: Dict[str, Any]) -> Dict[str, Any]:
         "updated_at": _now_iso(),
     }
     _tasks.put_item(Item=item)
+    # Return item without internal keys if possible, but for simplicity returning all
     return {"item": item}
 
-def _tool_get_task(args: Dict[str, Any]) -> Dict[str, Any]:
+def _tool_get_task(client_id: str, args: Dict[str, Any]) -> Dict[str, Any]:
     name = args.get("name")
     if not name:
         return {"error": "name is required"}
-    r = _tasks.get_item(Key={"name": str(name)})
+    r = _tasks.get_item(Key={"client_id": client_id, "name": str(name)})
     it = r.get("Item")
     if not it:
         return {"error": "not found"}
     return {"item": it}
 
-def _tool_update_task(args: Dict[str, Any]) -> Dict[str, Any]:
+def _tool_update_task(client_id: str, args: Dict[str, Any]) -> Dict[str, Any]:
     name = args.get("name")
     if not name:
         return {"error": "name is required"}
@@ -193,7 +198,6 @@ def _tool_update_task(args: Dict[str, Any]) -> Dict[str, Any]:
         "start_datetime": args.get("start_datetime"),
         "phone_number": args.get("phone_number"),
         "address": args.get("address"),
-        # legacy fallbacks
         "request@legacy": args.get("requirement"),
         "start_datetime@legacy": args.get("start_date"),
     }
@@ -207,7 +211,7 @@ def _tool_update_task(args: Dict[str, Any]) -> Dict[str, Any]:
     if not expr:
         return {"error": "nothing to update"}
     r = _tasks.update_item(
-        Key={"name": str(name)},
+        Key={"client_id": client_id, "name": str(name)},
         UpdateExpression="SET " + ", ".join(expr) + ", #updated_at = :u",
         ExpressionAttributeValues=values,
         ExpressionAttributeNames=names,
@@ -215,11 +219,11 @@ def _tool_update_task(args: Dict[str, Any]) -> Dict[str, Any]:
     )
     return {"item": r.get("Attributes")}
 
-def _tool_delete_task(args: Dict[str, Any]) -> Dict[str, Any]:
+def _tool_delete_task(client_id: str, args: Dict[str, Any]) -> Dict[str, Any]:
     name = args.get("name")
     if not name:
         return {"error": "name is required"}
-    _tasks.delete_item(Key={"name": str(name)})
+    _tasks.delete_item(Key={"client_id": client_id, "name": str(name)})
     return {"ok": True}
 
 _TOOLS_IMPL = {
@@ -231,15 +235,18 @@ _TOOLS_IMPL = {
 }
 
 
-def _fetch_faq_kb_text() -> str:
+def _fetch_faq_kb_text(client_id: str) -> str:
     items: List[Dict] = []
     last_key = None
-    # scan pages
-    for _ in range(20):
-        kwargs = {"Limit": 200}
+    # Use Query instead of Scan for tenant isolation
+    for _ in range(5): # Limit pages
+        kwargs = {
+            "KeyConditionExpression": Key("client_id").eq(client_id),
+            "Limit": 200
+        }
         if last_key:
             kwargs["ExclusiveStartKey"] = last_key
-        r = _faq.scan(**kwargs)
+        r = _faq.query(**kwargs)
         items.extend(r.get("Items", []))
         last_key = r.get("LastEvaluatedKey")
         if not last_key:
@@ -255,62 +262,83 @@ def _fetch_faq_kb_text() -> str:
         return ""
 
 
-def _fetch_history_messages(phone_number: str, limit: int = 20, call_sid: Optional[str] = None) -> List[Dict]:
+def _fetch_history_messages(client_id: str, phone_number: str, limit: int = 20, call_sid: Optional[str] = None) -> List[Dict]:
     try:
-        # When call_sid is specified, restrict history to that session only
+        # DB Schema: PK=client_id, SK=ts#phone_number (Wait, we decided sk=ts#phone_number but 
+        # actually queries are easier if we have GSI or if SK implies sortable TS.
+        # Let's check terraform definition again. 
+        # Terraform: PK=client_id, SK=sk (composite).
+        # We need to query by phone number. 
+        # Option A: Query PK=client_id, filter by phone. (Expensive if many logs)
+        # Option B: We need a GSI for phone based lookup? 
+        # Actually, for "chat history", we need logs for *this* phone.
+        # Let's assume we store SK as `phone_number#ts`. 
+        # Then we can query PK=client_id & SK begins_with(phone_number).
+        
+        # NOTE: Changing storage format to SK=`phone_number#ts`
+        prefix = phone_number + "#"
+        
+        kwargs = {
+            "KeyConditionExpression": Key("client_id").eq(client_id) & Key("sk").begins_with(prefix),
+            "ScanIndexForward": True, # Oldest first
+            "Limit": 50 # fetch a bit more then filter
+        }
+        
+        # If call_sid is provided, we can use GSI CallSidIndex (PK=call_sid) 
+        # This is global unique, so we don't strictly need client_id, but good to verify.
         if call_sid:
-            items: List[Dict] = []
-            last_key = None
-            # Fetch pages until we collect enough items for this call_sid (bounded)
-            while True:
-                kwargs = {
-                    "KeyConditionExpression": Key("phone_number").eq(phone_number),
-                    "ScanIndexForward": True,
-                    "Limit": 200,
-                }
-                if last_key:
-                    kwargs["ExclusiveStartKey"] = last_key
-                r = _calls.query(**kwargs)
-                page_items = r.get("Items", [])
-                items.extend([it for it in page_items if it.get("call_sid") == call_sid])
-                last_key = r.get("LastEvaluatedKey")
-                if not last_key or len(items) >= limit:
-                    break
-            # Sort by timestamp ascending, then clip to last `limit` if needed
-            items.sort(key=lambda it: it.get("ts", ""))
-            if len(items) > limit:
-                items = items[-limit:]
-        else:
-            r = _calls.query(
-                KeyConditionExpression=Key("phone_number").eq(phone_number),
-                ScanIndexForward=True,
-                Limit=limit,
-            )
-            items = r.get("Items", [])
-
+             kwargs = {
+                "IndexName": "CallSidIndex",
+                "KeyConditionExpression": Key("call_sid").eq(call_sid),
+                "Limit": 200
+             }
+        
+        r = _calls.query(**kwargs)
+        items = r.get("Items", [])
+        
+        # Filter for safety (in case of call_sid collision across tenants? unlikely but good practice)
+        if call_sid:
+            items = [it for it in items if it.get("client_id") == client_id]
+        
+        # If not call_sid, we used prefix, so items are already for this phone.
+        # But we need to sort by TS. SK is phone#ts, so it is sorted by phone then ts.
+        # Since phone is constant, it is sorted by TS.
+        
         history: List[Dict] = []
         for it in items:
             if it.get("user_text"):
                 history.append({"role": "user", "content": it.get("user_text")})
             if it.get("assistant_text"):
                 history.append({"role": "assistant", "content": it.get("assistant_text")})
+        
+        # Take last N
+        if len(history) > limit:
+            history = history[-limit:]
+            
         return history
     except (BotoCoreError, ClientError):
         return []
 
 
-def _log_turn(phone_number: str, user_text: str, assistant_text: str, call_sid: Optional[str] = None) -> None:
+def _log_turn(client_id: str, phone_number: str, user_text: str, assistant_text: str, call_sid: Optional[str] = None) -> None:
     try:
         normalized = _normalize_phone_number(phone_number) or phone_number
-        _calls.put_item(
-            Item={
-                "phone_number": normalized,
-                "ts": _now_iso(),
-                "user_text": user_text or "",
-                "assistant_text": assistant_text or "",
-                **({"call_sid": call_sid} if call_sid else {}),
-            }
-        )
+        ts = _now_iso()
+        # SK format: phone_number#ts
+        sk = f"{normalized}#{ts}"
+        
+        item = {
+            "client_id": client_id,
+            "sk": sk,
+            "ts": ts, # Separate attribute for GSI
+            "phone_number": normalized, # Attribute for ref
+            "user_text": user_text or "",
+            "assistant_text": assistant_text or "",
+        }
+        if call_sid:
+            item["call_sid"] = call_sid
+            
+        _calls.put_item(Item=item)
     except (BotoCoreError, ClientError):
         pass
 
@@ -422,14 +450,80 @@ def _call_openai(messages: List[Dict]) -> Optional[str]:
         return None
     return choices[0].get("message", {}).get("content")
 
-def _compile_tools_for_openai() -> List[Dict[str, Any]]:
+def _chat_with_tools(client_id: str, messages: List[Dict]) -> Optional[str]:
+    # We need to pass client_id to tools so they can access the correct DB records
+    # But tools are called by name from OpenAI.
+    # Strategy: Wrap the implementations or inject client_id inside the loop.
+    
+    tools = _compile_tools_for_openai(client_id)
+    if not isinstance(tools, list) or len(tools) == 0:
+        return _call_openai(messages)
+
+    max_steps = 4
+    current_messages = list(messages)
+    for _ in range(max_steps):
+        js = _call_openai_raw({
+            "model": "gpt-4o-mini",
+            "messages": current_messages,
+            "tools": tools,
+            "tool_choice": "auto",
+            "temperature": 0.3,
+            "max_tokens": 1200,
+        })
+        if not js:
+            return None
+        choices = js.get("choices") or []
+        if not choices:
+            return None
+        msg = choices[0].get("message", {})
+        tool_calls = msg.get("tool_calls") or []
+        content = msg.get("content")
+        if tool_calls:
+            current_messages.append({
+                "role": "assistant",
+                "tool_calls": tool_calls,
+                "content": content or "",
+            })
+            for tc in tool_calls:
+                fn_name = tc.get("function", {}).get("name")
+                args_json = tc.get("function", {}).get("arguments") or "{}"
+                try:
+                    args = json.loads(args_json)
+                except Exception:
+                    args = {}
+                
+                # Execute tool with client_id
+                impl = _TOOLS_IMPL.get(fn_name or "")
+                result: Any
+                if impl:
+                    try:
+                        # Inject client_id as first arg
+                        result = impl(client_id, args)
+                    except Exception as e:
+                        result = {"error": str(e)}
+                else:
+                    result = _execute_ext_tool(client_id, fn_name or "", args)
+                    
+                current_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id"),
+                    "name": fn_name or "",
+                    "content": json.dumps(result, ensure_ascii=False),
+                })
+            continue
+        if content:
+            return content
+        return None
+    return None
+
+
+def _compile_tools_for_openai(client_id: str) -> List[Dict[str, Any]]:
     tools: List[Dict[str, Any]] = []
-    func_cfg = _read_func_config()
+    func_cfg = _read_func_config(client_id)
     if isinstance(func_cfg.get("tools"), list):
         tools.extend(func_cfg.get("tools"))
-    ext_cfg = _read_ext_tools()
+    ext_cfg = _read_ext_tools(client_id)
     for t in ext_cfg.get("ext_tools", []) or []:
-        # expose as function tool for OpenAI
         try:
             name = t.get("name")
             description = t.get("description") or ""
@@ -453,8 +547,8 @@ def _template_str(s: str, args: Dict[str, Any]) -> str:
         out = out.replace("{{" + str(k) + "}}", str(v))
     return out
 
-def _execute_ext_tool(tool_name: str, tool_args: Dict[str, Any]) -> Dict[str, Any]:
-    cfg = _read_ext_tools()
+def _execute_ext_tool(client_id: str, tool_name: str, tool_args: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = _read_ext_tools(client_id)
     by_name: Dict[str, Any] = {}
     for t in cfg.get("ext_tools", []) or []:
         if t.get("name"):
@@ -500,72 +594,12 @@ def _execute_ext_tool(tool_name: str, tool_args: Dict[str, Any]) -> Dict[str, An
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-def _chat_with_tools(messages: List[Dict]) -> Optional[str]:
-    tools = _compile_tools_for_openai()
-    if not isinstance(tools, list) or len(tools) == 0:
-        return _call_openai(messages)
-
-    max_steps = 4
-    current_messages = list(messages)
-    for _ in range(max_steps):
-        js = _call_openai_raw({
-            "model": "gpt-4o-mini",
-            "messages": current_messages,
-            "tools": tools,
-            "tool_choice": "auto",
-            "temperature": 0.3,
-            "max_tokens": 1200,
-        })
-        if not js:
-            return None
-        choices = js.get("choices") or []
-        if not choices:
-            return None
-        msg = choices[0].get("message", {})
-        tool_calls = msg.get("tool_calls") or []
-        content = msg.get("content")
-        if tool_calls:
-            # Append the assistant message with tool_calls first (as returned by the model)
-            current_messages.append({
-                "role": "assistant",
-                "tool_calls": tool_calls,
-                "content": content or "",
-            })
-            # Execute each tool call sequentially and append results
-            for tc in tool_calls:
-                fn_name = tc.get("function", {}).get("name")
-                args_json = tc.get("function", {}).get("arguments") or "{}"
-                try:
-                    args = json.loads(args_json)
-                except Exception:
-                    args = {}
-                impl = _TOOLS_IMPL.get(fn_name or "")
-                result: Any
-                if impl:
-                    try:
-                        result = impl(args)
-                    except Exception as e:
-                        result = {"error": str(e)}
-                else:
-                    # try ext tool
-                    result = _execute_ext_tool(fn_name or "", args)
-                current_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.get("id"),
-                    "name": fn_name or "",
-                    "content": json.dumps(result, ensure_ascii=False),
-                })
-            continue
-        # No tool calls -> final answer
-        if content:
-            return content
-        # Fallback
-        return None
-    return None
-
 
 def handler(event, context):
     try:
+        # Auth: Get Client ID
+        client_id = auth.get_client_id(event)
+        
         http = event.get("requestContext", {}).get("http", {})
         method = http.get("method", "GET").upper()
         path = http.get("path", "/")
@@ -581,9 +615,9 @@ def handler(event, context):
             if not phone_number or not user_text:
                 return _resp(400, {"ok": False, "error": "phone_number and user_text required"})
 
-            system_prompt = _read_system_prompt()
-            faq_kb = _fetch_faq_kb_text()
-            history = _fetch_history_messages(phone_number, 20, call_sid)
+            system_prompt = _read_system_prompt(client_id)
+            faq_kb = _fetch_faq_kb_text(client_id)
+            history = _fetch_history_messages(client_id, phone_number, 20, call_sid)
 
             messages: List[Dict] = []
             if system_prompt:
@@ -593,15 +627,17 @@ def handler(event, context):
             messages.extend(history)
             messages.append({"role": "user", "content": user_text})
 
-            print("[ueki-chat] chat request: phone=", phone_number, "history_items=", len(history), "faq_kb_len=", len(faq_kb or ""), flush=True)
-            reply = _chat_with_tools(messages) or "申し訳ありません。現在お手続きできません。少し時間をおいてお試しください。"
+            print(f"[ueki-chat] client={client_id} phone={phone_number} history={len(history)}", flush=True)
+            
+            # Pass client_id to tool execution logic
+            reply = _chat_with_tools(client_id, messages) or "申し訳ありません。現在お手続きできません。少し時間をおいてお試しください。"
 
-            _log_turn(phone_number, user_text, reply, call_sid)
+            _log_turn(client_id, phone_number, user_text, reply, call_sid)
             return _resp(200, {"ok": True, "reply": reply})
 
         # Prompt management endpoints
         if method == "GET" and path == "/prompt":
-            content = _read_system_prompt()
+            content = _read_system_prompt(client_id)
             return _resp(200, {"ok": True, "id": "system", "content": content})
 
         if method == "PUT" and path == "/prompt":
@@ -609,12 +645,12 @@ def handler(event, context):
             content = body.get("content")
             if not isinstance(content, str) or not content.strip():
                 return _resp(400, {"ok": False, "error": "content (markdown) required"})
-            _put_system_prompt(content)
+            _put_system_prompt(client_id, content)
             return _resp(200, {"ok": True})
 
         # Function calling config endpoints
         if method == "GET" and path == "/func-config":
-            cfg = _read_func_config()
+            cfg = _read_func_config(client_id)
             return _resp(200, {"ok": True, "config": cfg})
 
         if method == "PUT" and path == "/func-config":
@@ -622,12 +658,12 @@ def handler(event, context):
             cfg = body.get("config")
             if not isinstance(cfg, dict):
                 return _resp(400, {"ok": False, "error": "config (object) required"})
-            _put_func_config(cfg)
+            _put_func_config(client_id, cfg)
             return _resp(200, {"ok": True})
 
         # External tools management endpoints
         if method == "GET" and path == "/ext-tools":
-            cfg = _read_ext_tools()
+            cfg = _read_ext_tools(client_id)
             return _resp(200, {"ok": True, "config": cfg})
 
         if method == "PUT" and path == "/ext-tools":
@@ -635,7 +671,7 @@ def handler(event, context):
             cfg = body.get("config")
             if not isinstance(cfg, dict):
                 return _resp(400, {"ok": False, "error": "config (object) required"})
-            _put_ext_tools(cfg)
+            _put_ext_tools(client_id, cfg)
             return _resp(200, {"ok": True})
 
         # Chat logs (CloudWatch) endpoint
@@ -690,5 +726,3 @@ def handler(event, context):
         return _resp(500, {"ok": False, "error": str(e)})
     except Exception as e:
         return _resp(500, {"ok": False, "error": str(e)})
-
-

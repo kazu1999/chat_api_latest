@@ -34,13 +34,13 @@ variable "twilio_account_sid" {
   type        = string
   description = "Twilio Account SID"
   sensitive   = true
-  default     = "To be filled"
+  default     = "TO BE FILLED"
 }
 
 variable "twilio_auth_token" {
   type        = string
   description = "Twilio Auth Token"
   sensitive   = true
-  default     = "To be filled"
+  default     = "TO BE FILLED"
 }
 
