@@ -61,6 +61,7 @@ Terraform で作成されます (`terraform/`)。
 ## API 仕様
 
 ベースURL: `https://{api_id}.execute-api.{region}.amazonaws.com`
+https://km5m358bik.execute-api.ap-northeast-1.amazonaws.com
 
 **認証**:
 - 原則として `Authorization: Bearer {id_token}` ヘッダーが必要です。
